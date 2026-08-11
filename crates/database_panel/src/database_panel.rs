@@ -354,6 +354,7 @@ impl DatabasePanel {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let fs = workspace.project().read(cx).fs().clone();
+        let project = workspace.project().clone();
         let weak_workspace = workspace.weak_handle();
         let (database_prefix, worktree) = match worktree_scope(workspace, cx) {
             Some((prefix, root, slug)) => (Some(prefix), Some((root, slug))),
@@ -372,6 +373,16 @@ impl DatabasePanel {
                 cx.subscribe(&filter_editor, |this: &mut Self, _, event, cx| {
                     if let EditorEvent::BufferEdited = event {
                         this.rebuild_entries(cx);
+                    }
+                }),
+                cx.subscribe(&project, |this: &mut Self, _, event, cx| {
+                    if matches!(
+                        event,
+                        project::Event::WorktreeAdded(_)
+                            | project::Event::WorktreeRemoved(_)
+                            | project::Event::WorktreeOrderChanged
+                    ) {
+                        this.update_worktree_scope(cx);
                     }
                 }),
             ];
@@ -1378,6 +1389,41 @@ impl DatabasePanel {
             }
         }
         self.selected_index = None;
+        self.rebuild_entries(cx);
+    }
+
+    /// Recomputes the worktree scope after the project's worktrees change, so
+    /// a panel created before the worktree finished loading (or kept across a
+    /// root change) does not keep a stale database filter.
+    fn update_worktree_scope(&mut self, cx: &mut Context<Self>) {
+        let scope = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| worktree_scope(workspace.read(cx), cx));
+        let (database_prefix, worktree) = match scope {
+            Some((prefix, root, slug)) => (Some(prefix), Some((root, slug))),
+            None => (None, None),
+        };
+        if self.database_prefix == database_prefix && self.worktree == worktree {
+            return;
+        }
+        self.database_prefix = database_prefix;
+        self.worktree = worktree;
+        self.migrations = MigrationsState::Idle;
+        self.migrations_task = None;
+        self.indexing.clear();
+        for connection_ix in 0..self.connections.len() {
+            let Some(connection) = self.connections.get_mut(connection_ix) else {
+                continue;
+            };
+            let expanded = connection.expanded;
+            connection.databases = LoadState::NotLoaded;
+            if expanded {
+                self.load_databases(connection_ix, cx);
+            } else {
+                self.load_schema_cache(connection_ix, cx);
+            }
+        }
         self.rebuild_entries(cx);
     }
 

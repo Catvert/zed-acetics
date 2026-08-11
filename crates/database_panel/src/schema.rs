@@ -150,7 +150,11 @@ pub async fn list_ran_migrations(
         let rows = match &config {
             ConnectionConfig::Sqlite { path } => {
                 let mut connection = open_sqlite(path).await?;
-                sqlx::query("SELECT migration FROM migrations")
+                let sql = format!(
+                    "SELECT migration FROM {}.migrations",
+                    quote_identifier(&database)
+                );
+                sqlx::query(&sql)
                     .fetch_all(&mut connection)
                     .await?
                     .into_iter()
@@ -254,19 +258,26 @@ pub fn quote_ident(config: &ConnectionConfig, identifier: &str) -> String {
     }
 }
 
-/// Renders a cell value as a SQL literal for interpolation into a generated
-/// statement (e.g. following a foreign key).
-pub fn sql_literal(value: &CellValue) -> String {
+/// Renders a cell value as a SQL literal in the dialect of the connection,
+/// for interpolation into a generated statement (e.g. following a foreign
+/// key).
+pub fn sql_literal(config: &ConnectionConfig, value: &CellValue) -> String {
+    let quote_text = |text: &str| match config {
+        ConnectionConfig::Sqlite { .. } => format!("'{}'", text.replace('\'', "''")),
+        // MariaDB's default sql_mode treats backslash as an escape character
+        // inside string literals, so it must be doubled as well.
+        ConnectionConfig::MariaDb { .. } => {
+            format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+        }
+    };
     match value {
         CellValue::Null => "NULL".to_string(),
         CellValue::Bool(value) => value.to_string(),
         CellValue::Integer(value) => value.to_string(),
         CellValue::UInteger(value) => value.to_string(),
         CellValue::Real(value) => value.to_string(),
-        CellValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
-        CellValue::Json(value) => {
-            format!("'{}'", value.to_string().replace('\'', "''"))
-        }
+        CellValue::Text(value) => quote_text(value),
+        CellValue::Json(value) => quote_text(&value.to_string()),
         CellValue::Bytes(_) | CellValue::Unsupported => "NULL".to_string(),
     }
 }
@@ -944,6 +955,29 @@ mod tests {
             serde_json::json!({"a": [1, 2]})
         );
         assert_eq!(CellValue::Bytes(4).to_json(), serde_json::json!("<4 bytes>"));
+    }
+
+    #[test]
+    fn test_sql_literal_escaping() {
+        let sqlite = ConnectionConfig::Sqlite {
+            path: "test.sqlite".to_string(),
+        };
+        let mariadb = ConnectionConfig::MariaDb {
+            host: "localhost".to_string(),
+            port: 3306,
+            username: "root".to_string(),
+            password: None,
+            databases: Vec::new(),
+        };
+        let text = CellValue::Text(r"it's C:\path".to_string());
+        assert_eq!(sql_literal(&sqlite, &text), r"'it''s C:\path'");
+        assert_eq!(sql_literal(&mariadb, &text), r"'it''s C:\\path'");
+        assert_eq!(sql_literal(&mariadb, &CellValue::Null), "NULL");
+        assert_eq!(sql_literal(&mariadb, &CellValue::Integer(-7)), "-7");
+        assert_eq!(
+            sql_literal(&mariadb, &CellValue::Json(serde_json::json!({"a": "b\\c"}))),
+            r#"'{"a":"b\\\\c"}'"#
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ use ui::{
     AbsoluteLength, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ResizableColumnsState,
     Table, TableInteractionState, TableResizeBehavior, Tooltip, prelude::*,
 };
+use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
 use settings::Settings as _;
@@ -122,16 +123,23 @@ fn classify_type(type_label: Option<&str>) -> ValueKind {
     }
 }
 
-fn date_color() -> Color {
-    Color::Custom(hsla(330.0 / 360.0, 0.60, 0.70, 1.0))
+/// There is no semantic [`Color`] for dates, so use a fixed pink hue with a
+/// lightness that keeps contrast in the theme's appearance.
+fn date_color(cx: &App) -> Color {
+    let lightness = if cx.theme().appearance().is_light() {
+        0.40
+    } else {
+        0.70
+    };
+    Color::Custom(hsla(330.0 / 360.0, 0.60, lightness, 1.0))
 }
 
-fn cell_color(value: &CellValue, kind: ValueKind) -> Color {
+fn cell_color(value: &CellValue, kind: ValueKind, cx: &App) -> Color {
     if value.is_null() {
         return Color::Muted;
     }
     match kind {
-        ValueKind::Date => return date_color(),
+        ValueKind::Date => return date_color(cx),
         ValueKind::Blob => return Color::Success,
         ValueKind::Bool => return Color::Warning,
         ValueKind::Number | ValueKind::Other => {}
@@ -294,7 +302,7 @@ impl QueryConsole {
         let kvp = db::kvp::KeyValueStore::global(cx);
         let task = cx.background_spawn(async move {
             kvp.read_kvp(INSPECTOR_WIDTH_KEY)
-                .ok()
+                .log_err()
                 .flatten()
                 .and_then(|value| value.parse::<f32>().ok())
         });
@@ -707,7 +715,7 @@ impl QueryConsole {
                                                     value.display(),
                                                 ))
                                                 .size(LabelSize::Small)
-                                                .color(cell_color(value, kind))
+                                                .color(cell_color(value, kind, cx))
                                                 .when(is_null, |label| label.italic())
                                                 .single_line()
                                                 .truncate();
@@ -903,7 +911,7 @@ impl QueryConsole {
             "SELECT * FROM {} WHERE {} = {};",
             schema::quote_ident(&self.config, &table),
             schema::quote_ident(&self.config, &target_column),
-            schema::sql_literal(value),
+            schema::sql_literal(&self.config, value),
         );
         let name = self.connection_name.clone();
         let config = self.config.clone();
@@ -954,11 +962,10 @@ impl QueryConsole {
             return;
         };
         let kvp = db::kvp::KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            let mut queries = crate::saved_queries::read_saved_queries(&kvp);
-            queries.retain(|existing| existing.name != name);
-            crate::saved_queries::write_saved_queries(kvp, &queries).await
-        })
+        cx.background_spawn(crate::saved_queries::update_saved_queries(
+            kvp,
+            move |queries| queries.retain(|existing| existing.name != name),
+        ))
         .detach_and_log_err(cx);
         cx.notify();
     }
@@ -980,12 +987,18 @@ impl QueryConsole {
         let Some(values) = result.rows.get(row) else {
             return;
         };
-        let object: serde_json::Map<String, serde_json::Value> = result
-            .columns
-            .iter()
-            .zip(values)
-            .map(|(column, value)| (column.name.clone(), value.to_json()))
-            .collect();
+        let mut object = serde_json::Map::new();
+        for (column, value) in result.columns.iter().zip(values) {
+            // Joins can return several columns with the same name; suffix the
+            // duplicates instead of silently keeping only the last value.
+            let mut key = column.name.clone();
+            let mut counter = 2;
+            while object.contains_key(&key) {
+                key = format!("{}_{counter}", column.name);
+                counter += 1;
+            }
+            object.insert(key, value.to_json());
+        }
         if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(object)) {
             cx.write_to_clipboard(ClipboardItem::new_string(json));
         }

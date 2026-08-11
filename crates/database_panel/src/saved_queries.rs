@@ -14,9 +14,11 @@ use ui::{
     HighlightedLabel, ListItem, ListItemSpacing, Modal, ModalFooter, ModalHeader, Section, Tooltip,
     prelude::*,
 };
+use std::sync::LazyLock;
+
 use ui_input::InputField;
 use util::ResultExt as _;
-use workspace::{ModalView, Workspace};
+use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
 
 use crate::{DatabasePanelSettings, QueryConsole, resolve_connection};
 
@@ -32,7 +34,7 @@ pub struct SavedQuery {
     pub sql: String,
 }
 
-pub(crate) fn read_saved_queries(kvp: &KeyValueStore) -> Vec<SavedQuery> {
+fn read_saved_queries(kvp: &KeyValueStore) -> Vec<SavedQuery> {
     kvp.read_kvp(SAVED_QUERIES_KEY)
         .log_err()
         .flatten()
@@ -40,12 +42,24 @@ pub(crate) fn read_saved_queries(kvp: &KeyValueStore) -> Vec<SavedQuery> {
         .unwrap_or_default()
 }
 
-pub(crate) async fn write_saved_queries(
-    kvp: KeyValueStore,
-    queries: &[SavedQuery],
-) -> anyhow::Result<()> {
+async fn write_saved_queries(kvp: KeyValueStore, queries: &[SavedQuery]) -> anyhow::Result<()> {
     let value = serde_json::to_string(queries)?;
     kvp.write_kvp(SAVED_QUERIES_KEY.to_string(), value).await
+}
+
+/// Applies `update` to the persisted list. The lock serializes the
+/// read-modify-write against the other save/delete tasks, which would
+/// otherwise overwrite each other's changes.
+pub(crate) async fn update_saved_queries(
+    kvp: KeyValueStore,
+    update: impl FnOnce(&mut Vec<SavedQuery>),
+) -> anyhow::Result<()> {
+    static LOCK: LazyLock<futures::lock::Mutex<()>> =
+        LazyLock::new(|| futures::lock::Mutex::new(()));
+    let _guard = LOCK.lock().await;
+    let mut queries = read_saved_queries(&kvp);
+    update(&mut queries);
+    write_saved_queries(kvp, &queries).await
 }
 
 /// A modal asking for a name under which to save the console's current SQL.
@@ -115,8 +129,7 @@ impl SaveQueryModal {
         };
         let original_name = self.original_name.clone();
         let kvp = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            let mut queries = read_saved_queries(&kvp);
+        let write = cx.background_spawn(update_saved_queries(kvp, move |queries| {
             if let Some(original_name) = original_name
                 && original_name != query.name
             {
@@ -126,14 +139,21 @@ impl SaveQueryModal {
                 Some(existing) => *existing = query,
                 None => queries.push(query),
             }
-            write_saved_queries(kvp, &queries).await
+        }));
+        // Link the console only once the write succeeded, so a failed save
+        // does not leave the tab claiming a saved query that was never
+        // persisted.
+        let console = self.console.clone();
+        cx.spawn(async move |_, cx| {
+            write.await?;
+            console
+                .update(cx, |console, cx| {
+                    console.set_saved_query_name(Some(name), cx);
+                })
+                .ok();
+            anyhow::Ok(())
         })
         .detach_and_log_err(cx);
-        self.console
-            .update(cx, |console, cx| {
-                console.set_saved_query_name(Some(name), cx);
-            })
-            .ok();
         cx.emit(DismissEvent);
     }
 }
@@ -294,11 +314,12 @@ impl SavedQueryPickerDelegate {
         if mat.candidate_id >= self.queries.len() {
             return;
         }
-        self.queries.remove(mat.candidate_id);
-        let queries = self.queries.clone();
+        let removed = self.queries.remove(mat.candidate_id);
         let kvp = KeyValueStore::global(cx);
-        cx.background_spawn(async move { write_saved_queries(kvp, &queries).await })
-            .detach_and_log_err(cx);
+        cx.background_spawn(update_saved_queries(kvp, move |queries| {
+            queries.retain(|existing| existing.name != removed.name);
+        }))
+        .detach_and_log_err(cx);
     }
 }
 
@@ -386,21 +407,37 @@ impl PickerDelegate for SavedQueryPickerDelegate {
                 .iter()
                 .filter_map(resolve_connection)
                 .find(|(name, _)| name.as_ref() == saved.connection);
-            if let Some((name, config)) = resolved {
-                self.workspace
-                    .update(cx, |workspace, cx| {
-                        QueryConsole::open_saved(
-                            workspace,
-                            name,
-                            config,
-                            saved.database.clone(),
-                            saved.sql.clone(),
-                            saved.name.clone(),
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
+            match resolved {
+                Some((name, config)) => {
+                    self.workspace
+                        .update(cx, |workspace, cx| {
+                            QueryConsole::open_saved(
+                                workspace,
+                                name,
+                                config,
+                                saved.database.clone(),
+                                saved.sql.clone(),
+                                saved.name.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+                None => {
+                    let message = format!(
+                        "Cannot open \"{}\": its connection \"{}\" is not configured",
+                        saved.name, saved.connection
+                    );
+                    self.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(NotificationId::unique::<SavedQueryPicker>(), message),
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
             }
         }
         self.dismissed(window, cx);
